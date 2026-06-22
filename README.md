@@ -262,7 +262,7 @@ To contribute: fork the repo, make your changes, and open a pull request. Please
 
 - [yousifamanuel](https://github.com/yousifamanuel) — original creator
 - [monkeyGOD86](https://github.com/monkeyGOD86) — hardware bring-up & testing
-- [Claude](https://claude.ai) (Anthropic) — MQTT remote control, Thinking & Working views, web settings panel, status-sync script
+- [Claude (Anthropic)](https://claude.ai) — MQTT remote control, Thinking & Working views, web settings panel, status-sync script
 
 ## License
 
