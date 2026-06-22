@@ -23,3 +23,5 @@ desktop.ini
 *.log
 *.tmp
 *.bak
+.playwright-cli/
+clawd_mochi/

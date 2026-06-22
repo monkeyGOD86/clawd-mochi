@@ -22,6 +22,8 @@
 #include <math.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
 
 // ── Pins ──────────────────────────────────────────────────────
 #define TFT_CS  4
@@ -57,6 +59,8 @@ uint16_t C_ORANGE, C_DARKBG, C_MUTED, C_GREEN;
 #define VIEW_EYES_SQUISH 1
 #define VIEW_CODE        2
 #define VIEW_DRAW        3
+#define VIEW_THINKING    4
+#define VIEW_WORKING     5
 
 uint8_t  currentView  = VIEW_EYES_NORMAL;
 bool     busy         = false;
@@ -65,6 +69,24 @@ uint8_t  animSpeed    = 1;   // 1=slow(default) 2=normal 3=fast
 
 uint16_t animBgColor  = 0;   // background for eye/logo animations
 uint16_t drawBgColor  = 0;   // background for canvas
+
+// ── Station WiFi ─────────────────────────────────
+String staSSID  = "410";
+String staPass  = "0123456789";
+bool   staConnected = false;
+
+// ── MQTT ─────────────────────────────────────────
+WiFiClient   mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+String mqttBroker  = "broker.emqx.io";
+uint16_t mqttPort = 1883;
+bool   mqttConnected = false;
+char   mqttClientId[24];
+unsigned long mqttLastTryMs = 0;
+uint8_t mqttRetryCount = 0;
+
+// ── NVS ─────────────────────────────────────────
+Preferences prefs;
 
 // ── Terminal ──────────────────────────────────────────────────
 #define TERM_COLS      15
@@ -289,6 +311,90 @@ void drawSquishEyes(bool closed = false) {
   }
 }
 
+// ── Thinking view — asymmetric eyes + thought dots ──────
+static uint8_t thinkDots = 0;  // 0=hidden, 1-3 visible
+
+void drawThinking() {
+  tft.fillScreen(animBgColor);
+  const int16_t lx = eyeLX(0), rx = eyeRX(0);
+  const int16_t ey = eyeY(), cy = eyeCY();
+  // Left eye: normal black square
+  tft.fillRect(lx, ey, EYE_W, EYE_H, C_BLACK);
+  // Left eye: tiny white pupil (normal centre)
+  tft.fillRect(lx + EYE_W/2 - 3, cy - 3, 6, 6, C_WHITE);
+
+  // Right eye: black square, but pupil shifted UP-RIGHT (thinking)
+  tft.fillRect(rx, ey, EYE_W, EYE_H, C_BLACK);
+  tft.fillRect(rx + EYE_W - 10, ey + 6, 6, 6, C_WHITE);
+
+  // Thought dots above right eye
+  if (thinkDots > 0) {
+    int16_t dx = rx + EYE_W/2;
+    int16_t dy = ey - 18;
+    uint16_t dc = C_GREEN;  // green dots
+    // dot 1 (left)
+    if (thinkDots >= 1) tft.fillCircle(dx - 10, dy, 3, dc);
+    // dot 2 (middle)
+    if (thinkDots >= 2) tft.fillCircle(dx,      dy, 3, dc);
+    // dot 3 (right)
+    if (thinkDots >= 3) tft.fillCircle(dx + 10, dy, 3, dc);
+  }
+}
+
+void animThinking() {
+  busy = true;
+  thinkDots = 0; drawThinking(); delay(speedMs(200));
+  for (uint8_t rep = 0; rep < 3; rep++) {
+    for (uint8_t d = 1; d <= 3; d++) {
+      thinkDots = d; drawThinking(); delay(speedMs(300));
+    }
+    thinkDots = 0; drawThinking(); delay(speedMs(200));
+  }
+  busy = false;
+}
+
+// ── Working view — down-looking eyes + alternating wink ──
+
+void drawWorking(bool blinkLeft = false, bool blinkRight = false) {
+  tft.fillScreen(animBgColor);
+  const int16_t lx = eyeLX(0), rx = eyeRX(0);
+  const int16_t ey = eyeY(), cy = eyeCY();
+
+  // Left eye
+  if (blinkLeft) {
+    tft.fillRect(lx, cy - 5, EYE_W, 10, C_BLACK);  // thin line
+  } else {
+    tft.fillRect(lx, ey, EYE_W, EYE_H, C_BLACK);
+    // pupil at bottom
+    tft.fillRect(lx + EYE_W/2 - 3, cy + 10, 6, 6, C_WHITE);
+  }
+
+  // Right eye
+  if (blinkRight) {
+    tft.fillRect(rx, cy - 5, EYE_W, 10, C_BLACK);
+  } else {
+    tft.fillRect(rx, ey, EYE_W, EYE_H, C_BLACK);
+    // pupil at bottom
+    tft.fillRect(rx + EYE_W/2 - 3, cy + 10, 6, 6, C_WHITE);
+  }
+
+  // "Busy" underline indicator
+  tft.fillRect(lx - 10, ey + EYE_H + 12, (rx - lx + EYE_W + 20), 3, C_ORANGE);
+}
+
+void animWorking() {
+  busy = true;
+  drawWorking(); delay(speedMs(200));
+  for (uint8_t i = 0; i < 4; i++) {
+    drawWorking(true, false);  delay(speedMs(100));  // left wink
+    drawWorking();             delay(speedMs(60));
+    drawWorking(false, true);  delay(speedMs(100));  // right wink
+    drawWorking();             delay(speedMs(60));
+  }
+  drawWorking(); delay(speedMs(200));
+  busy = false;
+}
+
 void drawCodeView() {
   termMode = false;
   tft.fillScreen(C_DARKBG);
@@ -443,11 +549,164 @@ void animLogoReveal() {
     int16_t y2 = pgm_read_word(&LOGO_SEGS[i][3]);
     tft.drawLine(x1, y1, x2, y2, C_WHITE);
     tft.drawLine(x1 + 1, y1, x2 + 1, y2, C_WHITE);
-    if (i % 4 == 0) { server.handleClient(); delay(speedMs(8)); }
+    if (i % 4 == 0) { ;delay(speedMs(8)); }
   }
   drawLogoFilled(animBgColor, C_WHITE);
   delay(1500);
   busy = false;
+}
+
+// ═════════════════════════════════════════════════════════════
+//  MQTT + STATION WiFi
+// ═════════════════════════════════════════════════════════════
+
+String getMacSuffix() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%02X%02X", mac[4], mac[5]);
+  return String(buf);
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  // Ensure null-terminated
+  char buf[64];
+  unsigned int n = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
+  memcpy(buf, payload, n);
+  buf[n] = '\0';
+
+  String top = String(topic);
+  String val = String(buf);
+  val.trim();
+
+  if (top.endsWith("/cmd")) {
+    if (val.length() != 1) return;
+    const char c = val[0];
+    switch (c) {
+      case 'w': routeCmdDirect(VIEW_EYES_NORMAL); break;
+      case 's': routeCmdDirect(VIEW_EYES_SQUISH); break;
+      case 'd': routeCmdDirect(VIEW_CODE);         break;
+      case 't': routeCmdDirect(VIEW_THINKING);    break;
+      case 'k': routeCmdDirect(VIEW_WORKING);     break;
+      case 'a': routeCmdDirect(VIEW_EYES_NORMAL); animLogoReveal(); break;
+    }
+  } else if (top.endsWith("/speed")) {
+    int v = val.toInt();
+    if (v >= 1 && v <= 3) animSpeed = v;
+  } else if (top.endsWith("/backlight")) {
+    setBacklight(val == "on" || val == "1");
+  } else if (top.endsWith("/bg")) {
+    animBgColor = hexToRgb565("#" + val);
+    drawBgColor = animBgColor;
+    switch (currentView) {
+      case VIEW_EYES_NORMAL: drawNormalEyes(); break;
+      case VIEW_EYES_SQUISH: drawSquishEyes(); break;
+      case VIEW_CODE:        drawCodeView();   break;
+      case VIEW_THINKING:    drawThinking();   break;
+      case VIEW_WORKING:     drawWorking();    break;
+      case VIEW_DRAW:        tft.fillScreen(drawBgColor); break;
+    }
+  }
+}
+
+void routeCmdDirect(uint8_t view) {
+  if (termMode) { termMode = false; }
+  currentView = view;
+  switch (view) {
+    case VIEW_EYES_NORMAL: animNormalEyes(); break;
+    case VIEW_EYES_SQUISH: animSquishEyes(); break;
+    case VIEW_THINKING:    animThinking();   break;
+    case VIEW_WORKING:     animWorking();    break;
+    case VIEW_CODE:
+      drawCodeView();
+      termMode = true; termClear(); termFullRedraw();
+      break;
+  }
+}
+
+void publishStatus() {
+  if (!mqttConnected) return;
+  String j = "{\"view\":"; j += currentView;
+  j += ",\"busy\":";   j += busy        ? "true" : "false";
+  j += ",\"bl\":";     j += backlightOn ? "true" : "false";
+  j += ",\"speed\":";  j += animSpeed;
+  j += "}";
+  mqttClient.publish("clawd/mochi/status", j.c_str());
+}
+
+void setupMqtt() {
+  String suffix = getMacSuffix();
+  snprintf(mqttClientId, sizeof(mqttClientId), "clawd-mochi-%s", suffix.c_str());
+  mqttClient.setServer(mqttBroker.c_str(), mqttPort);
+  mqttClient.setCallback(mqttCallback);
+}
+
+void mqttReconnect() {
+  if (!staConnected) return;
+  if (mqttClient.connected()) return;
+
+  unsigned long now = millis();
+  // Exponential backoff: 2s, 4s, 8s… capped at 60s
+  unsigned long wait = (1UL << mqttRetryCount) * 250;
+  if (wait > 60000) wait = 60000;
+  if (now - mqttLastTryMs < wait) return;
+
+  mqttLastTryMs = now;
+  Serial.print("[MQTT] connecting to ");
+  Serial.print(mqttBroker);
+  Serial.print("...");
+  if (mqttClient.connect(mqttClientId)) {
+    Serial.println(" OK");
+    mqttConnected = true;
+    mqttRetryCount = 0;
+    mqttClient.subscribe("clawd/mochi/cmd");
+    mqttClient.subscribe("clawd/mochi/speed");
+    mqttClient.subscribe("clawd/mochi/backlight");
+    mqttClient.subscribe("clawd/mochi/bg");
+    publishStatus();
+  } else {
+    Serial.print(" failed (rc=");
+    Serial.print(mqttClient.state());
+    Serial.println(")");
+    mqttConnected = false;
+    mqttRetryCount++;
+    if (mqttRetryCount > 8) mqttRetryCount = 8;
+  }
+}
+
+void initStationWiFi() {
+  // Read saved credentials from NVS
+  prefs.begin("clawd-mochi", true);  // read-only
+  String savedSSID = prefs.getString("staSSID", "");
+  String savedPass = prefs.getString("staPass", "");
+  prefs.end();
+
+  if (savedSSID.length() > 0) {
+    staSSID = savedSSID;
+    staPass = savedPass;
+  }
+
+  if (staSSID.length() == 0) {
+    Serial.println("[WiFi] No station credentials configured");
+    return;
+  }
+
+  Serial.print("[WiFi] Connecting to ");
+  Serial.println(staSSID);
+  WiFi.begin(staSSID.c_str(), staPass.c_str());
+
+  // Wait up to 10 seconds
+  for (int i = 0; i < 40; i++) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print(" OK, IP: ");
+      Serial.println(WiFi.localIP());
+      staConnected = true;
+      return;
+    }
+    delay(250);
+  }
+  Serial.println(" failed (check SSID/password)");
+  staConnected = false;
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -493,7 +752,7 @@ body{background:#1c1c20;font-family:'Courier New',monospace;color:#e8e4dc;
 .cbtn.dim{border-color:#2e2a28;color:#4a4540}
 
 /* View grid */
-.vgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;width:100%;max-width:390px}
+.vgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;width:100%;max-width:390px}
 .vbtn{background:#252428;border:1.5px solid #38343a;border-radius:12px;
   color:#d8d4cc;font-family:'Courier New',monospace;
   padding:14px 6px 10px;cursor:pointer;text-align:center;
@@ -507,6 +766,8 @@ body{background:#1c1c20;font-family:'Courier New',monospace;color:#e8e4dc;
 .vbtn[data-v="1"].active{border-color:#c96a3e;background:#201408}
 .vbtn[data-v="2"].active{border-color:#4a8acd;background:#0c1628}
 .vbtn[data-v="3"].active{border-color:#38343a;background:#201c18}
+.vbtn[data-v="4"].active{border-color:#f0c040;background:#1a1808}
+.vbtn[data-v="5"].active{border-color:#40c860;background:#081a10}
 
 /* Speed slider */
 .speed-row{width:100%;max-width:390px;display:flex;align-items:center;gap:10px}
@@ -550,6 +811,32 @@ input[type=range]{flex:1;accent-color:#c96a3e;cursor:pointer;height:20px}
 canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
   touch-action:none;cursor:crosshair;display:block}
 
+/* Settings modal */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;display:none;
+  align-items:center;justify-content:center;padding:20px}
+.overlay.open{display:flex}
+.modal{background:#1c1c20;border:1.5px solid #38343a;border-radius:14px;
+  max-width:390px;width:100%;padding:20px;max-height:90vh;overflow-y:auto}
+.mhdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.mttl{font-size:13px;color:#c96a3e;font-weight:bold;letter-spacing:2px}
+.mcls{background:none;border:1px solid #38343a;border-radius:8px;color:#8a8278;
+  font-size:16px;cursor:pointer;width:32px;height:32px}
+.ms{margin-bottom:16px}
+.msh{font-size:10px;color:#5a5048;letter-spacing:2px;font-weight:bold;margin-bottom:8px}
+.mrow{display:flex;gap:8px;margin-bottom:6px;align-items:center}
+.mrow label{font-size:11px;color:#b8b4ac;min-width:48px}
+.mrow select,.mrow input{flex:1;background:#0c1018;border:1.5px solid #2a2828;
+  border-radius:8px;color:#e8e4dc;font-family:'Courier New',monospace;
+  font-size:12px;padding:8px 10px;outline:none}
+.mrow select option{background:#1c1c20}
+.mbtn{background:#252428;border:1.5px solid #38343a;border-radius:9px;
+  color:#d8d4cc;font-family:'Courier New',monospace;font-size:11px;font-weight:bold;
+  padding:10px 16px;cursor:pointer;transition:all .12s;width:100%}
+.mbtn:active{transform:scale(.96)}
+.mstat{font-size:10px;color:#5a5048;font-family:'Courier New',monospace;margin-top:4px}
+.mstat.ok{color:#28b878}
+.mstat.er{color:#c96a3e}
+
 /* Toast */
 .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);
   background:#252428;border:1.5px solid #38343a;border-radius:9px;
@@ -563,6 +850,9 @@ canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
 <div class="hdr">
   <span class="mascot">&#x2590;&#x259B;&#x2588;&#x2588;&#x2588;&#x259C;&#x258C;<br>&#x259C;&#x2588;&#x2588;&#x2588;&#x2588;&#x2588;&#x259B;<br>&#x2598;&#x2598;&nbsp;&#x259D;&#x259D;</span>
   <div class="sitename">CLAWD &middot; MOCHI &middot; CONTROLLER</div>
+  <button style="position:absolute;top:12px;right:12px;background:none;border:1.5px solid #38343a;
+    border-radius:9px;color:#8a8278;font-size:18px;cursor:pointer;width:36px;height:36px;
+    display:flex;align-items:center;justify-content:center" onclick="toggleSettings()">&#x2699;</button>
 </div>
 
 <div class="busy" id="busy"><div class="busy-i"></div></div>
@@ -588,6 +878,16 @@ canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
     <span class="ic">{ }</span>
     <span class="nm">Claude Code</span>
     <span class="ht">opens terminal</span>
+  </button>
+  <button class="vbtn" data-v="4" onclick="setView(4)">
+    <span class="ic">&#x1F4AD;</span>
+    <span class="nm">Thinking</span>
+    <span class="ht">pondering...</span>
+  </button>
+  <button class="vbtn" data-v="5" onclick="setView(5)">
+    <span class="ic">&#x26A1;</span>
+    <span class="nm">Working</span>
+    <span class="ht">busy focus</span>
   </button>
   <button class="vbtn" data-v="3" onclick="toggleCanvas()">
     <span class="ic">&#11035;</span>
@@ -633,6 +933,42 @@ canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
     <button class="db" style="border-color:#28b878;color:#28b878" onclick="toggleCanvas()">&#10003; done</button>
   </div>
   <canvas id="cvs" width="240" height="240"></canvas>
+</div>
+
+<!-- Settings overlay -->
+<div class="overlay" id="settingsOverlay">
+  <div class="modal">
+    <div class="mhdr">
+      <span class="mttl">&#x2699; SETTINGS</span>
+      <button class="mcls" onclick="toggleSettings()">&#x2715;</button>
+    </div>
+
+    <div class="ms">
+      <div class="msh">// WiFi STATION</div>
+      <div class="mrow">
+        <select id="wifiSsid"><option value="">scanning...</option></select>
+      </div>
+      <div class="mrow">
+        <input type="password" id="wifiPass" placeholder="password">
+      </div>
+      <button class="mbtn" onclick="connectWifi()">&#x27A4; Connect to WiFi</button>
+      <div class="mstat" id="wifiStat"></div>
+    </div>
+
+    <div class="ms">
+      <div class="msh">// MQTT</div>
+      <div class="mrow">
+        <label>broker</label>
+        <input type="text" id="mqttBroker" value="broker.emqx.io">
+      </div>
+      <div class="mrow">
+        <label>port</label>
+        <input type="text" id="mqttPort" value="1883">
+      </div>
+      <button class="mbtn" onclick="setMqtt()">&#x27A4; Update MQTT</button>
+      <div class="mstat" id="mqttStat"></div>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -711,7 +1047,7 @@ async function setSpeed(v) {
 async function setView(v) {
   if (isBusy || termOpen || canvasOpen) return;
   if (v === 3) { toggleCanvas(); return; }  // canvas button in grid
-  const keys = ['w','s','d'];
+  const keys = ['w','s','d','','t','k'];
   if (!await req('/cmd?k=' + keys[v])) return;
   activeView = v;
   document.querySelectorAll('.vbtn').forEach(b =>
@@ -875,7 +1211,123 @@ async function clearAll() {
   // Always reset bg picker to default orange on page load
   document.getElementById('bgCol').value = '#aa4818';
   redrawCanvas('#aa4818');
+  // Init MQTT broker field
+  try {
+    const r = await fetch('/mqtt/status');
+    const j = await r.json();
+    document.getElementById('mqttBroker').value = j.broker || 'broker.emqx.io';
+    document.getElementById('mqttPort').value = j.port || '1883';
+  } catch(e) {}
+  // Load WiFi networks
+  await loadWifiNetworks();
 })();
+
+// \u2500\u2500 Settings \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+function toggleSettings() {
+  const o = document.getElementById('settingsOverlay');
+  o.classList.toggle('open');
+  if (o.classList.contains('open')) {
+    loadWifiNetworks();
+    updateMqttStatus();
+  }
+}
+
+async function loadWifiNetworks() {
+  const sel = document.getElementById('wifiSsid');
+  try {
+    const r = await fetch('/wifi/scan');
+    const nets = await r.json();
+    sel.innerHTML = '<option value="">-- select network --</option>';
+    nets.forEach(n => {
+      const o = document.createElement('option');
+      o.value = n.ssid;
+      o.textContent = n.ssid + ' (' + n.rssi + 'dBm)' + (n.open ? ' OPEN' : '');
+      sel.appendChild(o);
+    });
+    document.getElementById('wifiStat').textContent = nets.length + ' networks found';
+    document.getElementById('wifiStat').className = 'mstat ok';
+  } catch(e) {
+    sel.innerHTML = '<option value="">scan failed</option>';
+    document.getElementById('wifiStat').textContent = 'scan failed, is AP connected?';
+    document.getElementById('wifiStat').className = 'mstat er';
+  }
+}
+
+async function connectWifi() {
+  const ssid = document.getElementById('wifiSsid').value;
+  if (!ssid) { toast('select a network', false); return; }
+  const pass = document.getElementById('wifiPass').value;
+  const btn = document.querySelector('.mbtn');
+  btn.disabled = true; btn.textContent = 'connecting...';
+  try {
+    const r = await fetch('/wifi/config?ssid=' + encodeURIComponent(ssid) + '&pass=' + encodeURIComponent(pass));
+    if (r.ok) {
+      toast('WiFi connecting...');
+      document.getElementById('wifiStat').textContent = 'connecting to ' + ssid + '...';
+      document.getElementById('wifiStat').className = 'mstat';
+      // Poll for connection
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          const s = await fetch('/wifi/status');
+          const j = await s.json();
+          if (j.connected) {
+            document.getElementById('wifiStat').textContent = 'connected: ' + j.ip;
+            document.getElementById('wifiStat').className = 'mstat ok';
+            toast('WiFi connected!');
+            btn.disabled = false; btn.textContent = '\u27a4 Connect to WiFi';
+            updateMqttStatus();
+            return;
+          }
+        } catch(e) {}
+      }
+      document.getElementById('wifiStat').textContent = 'connection timeout';
+      document.getElementById('wifiStat').className = 'mstat er';
+    } else {
+      document.getElementById('wifiStat').textContent = 'config failed';
+      document.getElementById('wifiStat').className = 'mstat er';
+    }
+  } catch(e) {
+    document.getElementById('wifiStat').textContent = 'error: ' + e.message;
+    document.getElementById('wifiStat').className = 'mstat er';
+  }
+  btn.disabled = false; btn.textContent = '\u27a4 Connect to WiFi';
+}
+
+async function updateMqttStatus() {
+  try {
+    const r = await fetch('/mqtt/status');
+    const j = await r.json();
+    if (j.connected) {
+      document.getElementById('mqttStat').textContent = 'connected (client: ' + j.clientId + ')';
+      document.getElementById('mqttStat').className = 'mstat ok';
+    } else {
+      document.getElementById('mqttStat').textContent = 'disconnected (retries: ' + j.retries + ')';
+      document.getElementById('mqttStat').className = 'mstat er';
+    }
+  } catch(e) {
+    document.getElementById('mqttStat').textContent = 'status unavailable';
+    document.getElementById('mqttStat').className = 'mstat er';
+  }
+}
+
+async function setMqtt() {
+  const broker = document.getElementById('mqttBroker').value.trim();
+  const port = document.getElementById('mqttPort').value.trim();
+  if (!broker) { toast('enter broker address', false); return; }
+  try {
+    const r = await fetch('/mqtt/config?broker=' + encodeURIComponent(broker) + '&port=' + encodeURIComponent(port));
+    if (r.ok) {
+      toast('MQTT config updated');
+      document.getElementById('mqttStat').textContent = 'reconnecting...';
+      document.getElementById('mqttStat').className = 'mstat';
+      setTimeout(updateMqttStatus, 3000);
+    }
+  } catch(e) {
+    document.getElementById('mqttStat').textContent = 'error: ' + e.message;
+    document.getElementById('mqttStat').className = 'mstat er';
+  }
+}
 </script>
 </body>
 </html>
@@ -913,6 +1365,8 @@ void routeCmd() {
       currentView = VIEW_EYES_NORMAL;
       animLogoReveal();
       break;
+    case 't': currentView = VIEW_THINKING; animThinking(); break;
+    case 'k': currentView = VIEW_WORKING;  animWorking();  break;
   }
 }
 
@@ -938,6 +1392,8 @@ void routeRedraw() {
     case VIEW_EYES_NORMAL: drawNormalEyes(); break;
     case VIEW_EYES_SQUISH: drawSquishEyes(); break;
     case VIEW_CODE:        drawCodeView();   break;
+    case VIEW_THINKING:    drawThinking();   break;
+    case VIEW_WORKING:     drawWorking();    break;
     case VIEW_DRAW:        tft.fillScreen(drawBgColor); break;
   }
   server.send(200, "application/json", "{\"ok\":1}");
@@ -996,6 +1452,71 @@ void routeBacklight() {
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
+// ── New web routes: WiFi + MQTT ─────────────────────
+
+void routeWifiScan() {
+  int n = WiFi.scanNetworks();
+  String j = "[";
+  for (int i = 0; i < n; i++) {
+    if (i > 0) j += ",";
+    j += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + WiFi.RSSI(i) + ",\"open\":" + (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "true" : "false") + "}";
+  }
+  j += "]";
+  WiFi.scanDelete();
+  server.send(200, "application/json", j);
+}
+
+void routeWifiConfig() {
+  if (!server.hasArg("ssid")) { server.send(400, "application/json", "{\"e\":\"missing ssid\"}"); return; }
+  String newSSID = server.arg("ssid");
+  String newPass = server.hasArg("pass") ? server.arg("pass") : "";
+  prefs.begin("clawd-mochi", false);
+  prefs.putString("staSSID", newSSID);
+  prefs.putString("staPass", newPass);
+  prefs.end();
+  server.send(200, "application/json", "{\"ok\":1}");
+  // Reconnect with new credentials
+  staSSID = newSSID;
+  staPass = newPass;
+  WiFi.disconnect(false, true);  // clear saved
+  WiFi.begin(staSSID.c_str(), staPass.c_str());
+}
+
+void routeWifiStatus() {
+  String j = "{\"connected\":";  j += staConnected ? "true" : "false";
+  j += ",\"ssid\":\"";          j += staSSID;
+  j += "\",\"ip\":\"";          j += staConnected ? WiFi.localIP().toString() : "";
+  j += "\",\"rssi\":";          j += staConnected ? String(WiFi.RSSI()) : "0";
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+void routeMqttConfig() {
+  if (server.hasArg("broker")) {
+    mqttBroker = server.arg("broker");
+    mqttClient.setServer(mqttBroker.c_str(), mqttPort);
+    mqttRetryCount = 0;   // force immediate reconnect
+    mqttLastTryMs = 0;
+  }
+  if (server.hasArg("port")) {
+    mqttPort = server.arg("port").toInt();
+    mqttClient.setServer(mqttBroker.c_str(), mqttPort);
+    mqttRetryCount = 0;
+    mqttLastTryMs = 0;
+  }
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
+void routeMqttStatus() {
+  String j = "{\"connected\":";   j += mqttConnected ? "true" : "false";
+  j += ",\"broker\":\"";         j += mqttBroker;
+  j += "\",\"port\":";           j += mqttPort;
+  j += ",\"clientId\":\"";       j += mqttClientId;
+  j += "\",\"retries\":";        j += mqttRetryCount;
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
 // Convert RGB565 back to #RRGGBB for state endpoint
 String rgb565ToHex(uint16_t c) {
   uint8_t r = ((c >> 11) & 0x1F) << 3;
@@ -1012,6 +1533,8 @@ void routeState() {
   j += ",\"term\":";   j += termMode    ? "true" : "false";
   j += ",\"bl\":";     j += backlightOn ? "true" : "false";
   j += ",\"speed\":";  j += animSpeed;
+  j += ",\"sta\":";    j += staConnected ? "true" : "false";
+  j += ",\"mqtt\":";   j += mqttConnected ? "true" : "false";
   j += "}";
   server.send(200, "application/json", j);
 }
@@ -1045,8 +1568,12 @@ void setup() {
   animLogoReveal();
 
   // ── Start WiFi ─────────────────────────────────────────────
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS);
+  initStationWiFi();
+
+  // ── Start MQTT ─────────────────────────────────────────────
+  setupMqtt();
 
   // ── WiFi info screen (stays until first web request) ───────
   tft.fillScreen(C_DARKBG);
@@ -1055,12 +1582,17 @@ void setup() {
   tft.setCursor(12, 16);  tft.print("WiFi: ClaWD-Mochi");
   tft.setTextColor(C_MUTED);  tft.setTextSize(1);
   tft.setCursor(12, 44);  tft.print("password: clawd1234");
+  if (staConnected) {
+    tft.setTextColor(C_GREEN); tft.setTextSize(1);
+    tft.setCursor(12, 62); tft.print("Station: ");
+    tft.print(WiFi.localIP());
+  }
   tft.setTextColor(C_WHITE);  tft.setTextSize(2);
-  tft.setCursor(12, 68);  tft.print("Open browser:");
+  tft.setCursor(12, 82);  tft.print("Open browser:");
   tft.setTextColor(C_ORANGE); tft.setTextSize(2);
-  tft.setCursor(12, 94);  tft.print("192.168.4.1");
+  tft.setCursor(12, 108); tft.print("192.168.4.1");
   tft.setTextColor(C_MUTED);  tft.setTextSize(1);
-  tft.setCursor(12, 124); tft.print("press any button to start");
+  tft.setCursor(12, 138); tft.print("press any button to start");
 
   // ── Register routes ────────────────────────────────────────
   server.on("/",            HTTP_GET, routeRoot);
@@ -1073,6 +1605,11 @@ void setup() {
   server.on("/draw/stroke", HTTP_GET, routeDrawStroke);
   server.on("/backlight",   HTTP_GET, routeBacklight);
   server.on("/state",       HTTP_GET, routeState);
+  server.on("/wifi/scan",   HTTP_GET, routeWifiScan);
+  server.on("/wifi/config", HTTP_GET, routeWifiConfig);
+  server.on("/wifi/status", HTTP_GET, routeWifiStatus);
+  server.on("/mqtt/config", HTTP_GET, routeMqttConfig);
+  server.on("/mqtt/status", HTTP_GET, routeMqttStatus);
   server.onNotFound(routeNotFound);
   server.begin();
 
@@ -1084,4 +1621,34 @@ void setup() {
 //  LOOP
 // ═════════════════════════════════════════════════════════════
 
-void loop() { server.handleClient(); }
+void loop() {
+  server.handleClient();
+
+  // Station WiFi keep-alive
+  if (staSSID.length() > 0 && WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastTry = 0;
+    unsigned long now = millis();
+    if (now - lastTry > 30000) {
+      lastTry = now;
+      Serial.println("[WiFi] reconnecting…");
+      WiFi.begin(staSSID.c_str(), staPass.c_str());
+    }
+  } else if (WiFi.status() == WL_CONNECTED && !staConnected) {
+    staConnected = true;
+    Serial.print("[WiFi] reconnected, IP: ");
+    Serial.println(WiFi.localIP());
+  } else if (WiFi.status() != WL_CONNECTED) {
+    staConnected = false;
+  }
+
+  // MQTT loop
+  if (staConnected) {
+    if (!mqttClient.connected()) {
+      mqttReconnect();
+    } else {
+      mqttClient.loop();
+    }
+  } else {
+    mqttConnected = false;
+  }
+}
