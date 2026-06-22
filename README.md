@@ -25,12 +25,16 @@ A physical desk companion inspired by **Clawd** — the pixel-crab mascot of Cla
 
 ## What it does
 
-Clawd Mochi sits on your desk and shows animated expressions on a small color display. You control it from any phone or browser by connecting to its built-in WiFi hotspot:
+Clawd Mochi sits on your desk and shows animated expressions on a small color display. You control it from any phone or browser by connecting to its built-in WiFi hotspot, **or remotely via MQTT**:
 
 - **Normal eyes** — pixel-art square eyes with wiggle and blink animations
 - **Squish eyes** — `> <` happy squint with open/close animation
+- **Thinking** — asymmetric eyes + animated thought dots (⋯)
+- **Working** — downward-focused eyes + alternating wink animation
 - **Claude Code** — displays "Claude Code" with an interactive terminal
 - **Canvas** — draw anything on the display from your phone in real time
+- **MQTT Remote Push** — control expressions from anywhere via MQTT broker
+- **Claude Status Sync** — your Claude agent can push its current status to the device
 
 ---
 
@@ -131,13 +135,37 @@ You should see the web controller:
 | ------------------ | ----------------------------------------------- |
 | Normal eyes        | Plays wiggle + blink animation                  |
 | Squish eyes        | Plays open/close animation                      |
+| Thinking           | Asymmetric eyes + animated thought dots         |
+| Working            | Downward eyes + alternating wink animation      |
 | Claude Code        | Shows code display, opens terminal              |
 | Canvas             | Enter drawing mode — draw on display from phone |
 | Speed slider       | Controls animation speed (slow / normal / fast) |
 | Background color   | Changes background color of all views           |
 | Pen color          | Sets drawing color for canvas                   |
 | Display on/off     | Toggles the backlight                           |
-| ✓ done (in canvas) | Exits canvas mode                               |
+| ⚙ Settings         | Configure WiFi station & view MQTT status       |
+
+### MQTT remote control
+
+Connect the device to your home WiFi (via the ⚙ Settings panel) and you can control it from anywhere using MQTT:
+
+| Topic                  | Direction | Values                | Effect             |
+| ---------------------- | --------- | --------------------- | ------------------ |
+| `clawd/mochi/cmd`      | subscribe | `w` `s` `t` `k` `d` `a` | Switch expression |
+| `clawd/mochi/speed`    | subscribe | `1` `2` `3`           | Animation speed    |
+| `clawd/mochi/backlight`| subscribe | `on` `off`            | Display backlight  |
+| `clawd/mochi/bg`       | subscribe | `RRGGBB` (hex)        | Background colour  |
+| `clawd/mochi/status`   | publish   | JSON                  | Device status      |
+
+**Default broker:** `broker.emqx.io:1883` (configurable via Settings panel)
+
+Test with any MQTT app (MQTT Tool, IoT MQTT Panel, etc.), or use the included `push_status.js` script:
+
+```bash
+node push_status.js think   # → Thinking expression
+node push_status.js work    # → Working expression
+node push_status.js idle    # → Normal eyes
+```
 
 ---
 
@@ -220,14 +248,21 @@ delay(speedMs(8)); // lower = faster
 
 Contributions are very welcome! Here are some ideas:
 
-- **New animations** — add new expressions, transitions, or idle behaviors
+- **New animations** — add new expressions, transitions, or idle behaviors ✅ Added: Thinking & Working views
 - **New views** — weather display, clock, notification badges, pixel art scenes
 - **Sound** — add a small buzzer for sound effects
 - **Sensors** — connect a touch sensor or button for physical interaction
 - **OTA updates** — add over-the-air firmware updates
-- **MQTT / Home Assistant** — connect to smart home platforms
+- **MQTT / Home Assistant** — connect to smart home platforms ✅ Added: MQTT remote push via broker.emqx.io
+- **Claude integration** — control the device from Claude Code conversations ✅ Added: push_status.js script
 
 To contribute: fork the repo, make your changes, and open a pull request. Please keep the single-file structure (`clawd_mochi.ino`) so it stays easy for beginners to flash.
+
+## Contributors
+
+- [yousifamanuel](https://github.com/yousifamanuel) — original creator
+- [monkeyGOD86](https://github.com/monkeyGOD86) — hardware bring-up & testing
+- [Claude](https://claude.ai) (Anthropic) — MQTT remote control, Thinking & Working views, web settings panel, status-sync script
 
 ## License
 
